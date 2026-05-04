@@ -1,6 +1,6 @@
-# MultipleChoiceGrader (Job-based)
+# MultipleChoiceGrader (Job-based + configurable paths)
 
-## Job folder structure
+## Job folder structure (existing style)
 
 ```
 jobs/
@@ -13,51 +13,70 @@ jobs/
 
 The app writes extracted output to `results/extracted-json/`.
 
-## Answer key format
+## appsettings.json configuration
 
 ```json
 {
-  "assignmentName": "Biology Chapter 5 Test",
-  "questions": {
-    "1": "A",
-    "2": "C",
-    "3": "B"
+  "Grading": {
+    "DefaultJobPath": "jobs/sample-job",
+    "AnswerKeyPath": "jobs/sample-job/answer-key.json",
+    "SubmissionsPath": "jobs/sample-job/submissions",
+    "ResultsPath": "jobs/sample-job/results",
+    "ExtractorMode": "Hybrid",
+    "UseCache": true
   }
 }
 ```
 
-## Settings format
+Path precedence is:
+1. Command-line explicit path arguments (`--answer-key`, `--submissions`, `--results`)
+2. `appsettings.json` values
+3. Job-folder defaults (`<job>/answer-key.json`, `<job>/submissions`, `<job>/results`)
 
-```json
-{
-  "extractorMode": "Hybrid",
-  "validChoices": ["A", "B", "C", "D"],
-  "allowBlankAnswers": true,
-  "needsReviewWhenAiUsed": false,
-  "needsReviewWhenConfidenceBelow": "high",
-  "studentNameFallback": "FileName"
-}
-```
-
-If `settings.json` is missing, defaults are created automatically.
+If `--job` is not provided, `Grading:DefaultJobPath` is used.
 
 ## Command examples
+
+### A) Existing job-folder style
 
 - `dotnet run -- --job jobs/sample-job`
 - `dotnet run -- --job jobs/sample-job --extract-only`
 - `dotnet run -- --job jobs/sample-job --grade-only`
 - `dotnet run -- --job jobs/sample-job --use-cache`
-- `dotnet run -- --job jobs/sample-job --force-reextract`
+
+### B) appsettings.json style
+
+- `dotnet run`
+
+Using:
+
+```json
+{
+  "Grading": {
+    "DefaultJobPath": "jobs/sample-job",
+    "AnswerKeyPath": "jobs/sample-job/answer-key.json",
+    "SubmissionsPath": "jobs/sample-job/submissions",
+    "ResultsPath": "jobs/sample-job/results",
+    "ExtractorMode": "Hybrid"
+  }
+}
+```
+
+### C) Command-line override style
+
+- `dotnet run -- --answer-key "C:\\Tests\\Test1\\answer-key.json" --submissions "C:\\Tests\\Test1\\submissions" --results "C:\\Tests\\Test1\\results"`
+
+## Behavior notes
+
+- Relative paths are resolved from the current working directory.
+- Absolute paths are used as-is.
+- Answer key file must exist.
+- Submissions folder must exist.
+- Results folder is created automatically if missing.
+- `results/extracted-json` is created automatically if missing.
 
 ## Extraction vs grading
 
-- **Extraction stage** reads documents and produces one JSON per submission in `results/extracted-json/`.
-- **Grading stage** reads `answer-key.json` and extracted JSON files, then calculates scores in code.
+- **Extraction stage** reads from the resolved submissions path and writes JSON into `ResultsPath/extracted-json`.
+- **Grading stage** reads from the resolved answer key path and extracted JSON files, then writes reports to `ResultsPath`.
 - AI is only for extraction/OCR fallback, never grading.
-
-## Limitations and review guidance
-
-- Current AI extraction function is a stub; wire this to your OCR/AI provider.
-- Rule-based extraction expects text patterns like `1: A` and `Name: Jane Doe`.
-- `review-needed.csv` should be used for manual quality checks where confidence/warnings indicate uncertainty.
-- For scanned PDFs/images, validate extraction confidence before using grades operationally.
