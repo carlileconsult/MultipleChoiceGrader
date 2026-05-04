@@ -87,6 +87,7 @@ public sealed class GradingOptions
     public bool EnableOcr { get; set; } = true;
     public string OcrLanguage { get; set; } = "eng";
     public bool UseCache { get; set; } = true;
+    public string? QuizId { get; set; }
 }
 
 public sealed class GradingRunConfiguration
@@ -116,6 +117,7 @@ internal static class AppSettingsLoader
             grading.SubmissionsPath = ReadString(g, "SubmissionsPath");
             grading.ResultsPath = ReadString(g, "ResultsPath");
             grading.UseCache = ReadBool(g, "UseCache") ?? true;
+            grading.QuizId = ReadString(g, "QuizId");
             grading.EnableOcr = ReadBool(g, "EnableOcr") ?? true;
             grading.OcrLanguage = ReadString(g, "OcrLanguage") ?? "eng";
             if (g.TryGetProperty("SupportedExtensions", out var exts) && exts.ValueKind == JsonValueKind.Array)
@@ -200,7 +202,7 @@ internal sealed class JobRunner
     public async Task<JobRunSummary> RunAsync(CliOptions options, GradingOptions gradingOptions)
     {
         var runConfig = JobContext.Resolve(options, gradingOptions);
-        var answerKey = ReadJson<AnswerKey>(runConfig.AnswerKeyPath);
+        var answerKey = AnswerKeyLoader.Load(runConfig.AnswerKeyPath, gradingOptions.QuizId);
         var submissions = Directory.GetFiles(runConfig.SubmissionsPath).OrderBy(Path.GetFileName).ToList();
 
         var ocr = new StubOcrService(gradingOptions.EnableOcr);
@@ -269,7 +271,6 @@ internal sealed class JobRunner
         return matches.ToDictionary(m => m.Groups[1].Value, m => m.Groups[2].Value.ToUpperInvariant());
     }
     private static string? ParseStudent(string text) { var m = Regex.Match(text ?? "", @"(?im)^\s*name\s*[:\-]\s*(.+)$"); return m.Success ? m.Groups[1].Value.Trim() : null; }
-    private static T ReadJson<T>(string path) => JsonSerializer.Deserialize<T>(File.ReadAllText(path), new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }) ?? throw new InvalidOperationException($"Could not deserialize {path}");
 }
 
 internal static class JobContext
@@ -292,6 +293,99 @@ internal static class JobContext
 }
 
 internal sealed record AnswerKey(string AssignmentName, Dictionary<string, string> Questions);
+public sealed class AnswerKeyFile
+{
+    public List<QuizAnswerKey> AnswerKeys { get; set; } = new();
+}
+
+public sealed class QuizAnswerKey
+{
+    public string QuizId { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string? Source { get; set; }
+    public string? Section { get; set; }
+    public string? Chapter { get; set; }
+    public List<AnswerKeyItem> Answers { get; set; } = new();
+}
+
+public sealed class AnswerKeyItem
+{
+    public int QuestionNumber { get; set; }
+    public string CorrectChoice { get; set; } = "";
+    public string? AnswerText { get; set; }
+}
+
+internal static class AnswerKeyLoader
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+    public static AnswerKey Load(string path, string? configuredQuizId)
+    {
+        var json = File.ReadAllText(path);
+        try
+        {
+            if (TryLoadLegacy(json, out var legacy)) return legacy!;
+
+            var quizzes = LoadQuizzes(json);
+            ValidateAndNormalize(quizzes);
+            var selected = SelectQuiz(quizzes, configuredQuizId);
+            return new AnswerKey(string.IsNullOrWhiteSpace(selected.Title) ? selected.QuizId : selected.Title, selected.Answers.ToDictionary(a => a.QuestionNumber.ToString(), a => a.CorrectChoice));
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException($"Invalid answer key JSON in '{path}': {ex.Message}", ex);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidOperationException($"Invalid answer key file '{path}': {ex.Message}", ex);
+        }
+    }
+
+    private static bool TryLoadLegacy(string json, out AnswerKey? answerKey)
+    {
+        answerKey = JsonSerializer.Deserialize<AnswerKey>(json, JsonOptions);
+        return answerKey is not null && !string.IsNullOrWhiteSpace(answerKey.AssignmentName) && answerKey.Questions is not null && answerKey.Questions.Count > 0;
+    }
+
+    private static List<QuizAnswerKey> LoadQuizzes(string json)
+    {
+        var combined = JsonSerializer.Deserialize<AnswerKeyFile>(json, JsonOptions);
+        if (combined?.AnswerKeys?.Count > 0) return combined.AnswerKeys;
+
+        var single = JsonSerializer.Deserialize<QuizAnswerKey>(json, JsonOptions);
+        if (single is not null && (!string.IsNullOrWhiteSpace(single.QuizId) || single.Answers.Count > 0)) return new List<QuizAnswerKey> { single };
+
+        throw new InvalidOperationException("Could not parse answer key as legacy format, single quiz format, or combined answerKeys format.");
+    }
+
+    private static void ValidateAndNormalize(List<QuizAnswerKey> quizzes)
+    {
+        if (quizzes.Count == 0) throw new InvalidOperationException("No quizzes were found in the answer key file.");
+        foreach (var quiz in quizzes)
+        {
+            if (string.IsNullOrWhiteSpace(quiz.QuizId)) throw new InvalidOperationException("Each quiz must include quizId.");
+            if (quiz.Answers.Count == 0) throw new InvalidOperationException($"Quiz '{quiz.QuizId}' has no answers.");
+            foreach (var answer in quiz.Answers)
+            {
+                if (answer.QuestionNumber <= 0) throw new InvalidOperationException($"Quiz '{quiz.QuizId}' has an invalid questionNumber '{answer.QuestionNumber}'.");
+                if (string.IsNullOrWhiteSpace(answer.CorrectChoice)) throw new InvalidOperationException($"Quiz '{quiz.QuizId}' question {answer.QuestionNumber} is missing correctChoice.");
+                answer.CorrectChoice = answer.CorrectChoice.Trim().ToLowerInvariant();
+            }
+        }
+    }
+
+    private static QuizAnswerKey SelectQuiz(List<QuizAnswerKey> quizzes, string? configuredQuizId)
+    {
+        if (quizzes.Count == 1) return quizzes[0];
+        var available = string.Join(Environment.NewLine, quizzes.Select(x => $"- {x.QuizId}"));
+        if (string.IsNullOrWhiteSpace(configuredQuizId))
+            throw new InvalidOperationException($"Multiple answer keys were found. Please set Grading:QuizId in appsettings.json.{Environment.NewLine}Available quizIds:{Environment.NewLine}{available}");
+        var selected = quizzes.FirstOrDefault(x => string.Equals(x.QuizId, configuredQuizId, StringComparison.OrdinalIgnoreCase));
+        if (selected is null)
+            throw new InvalidOperationException($"Grading:QuizId '{configuredQuizId}' was not found.{Environment.NewLine}Available quizIds:{Environment.NewLine}{available}");
+        return selected;
+    }
+}
 internal sealed record ExtractedSubmission(string SourceFileName, string StudentName, Dictionary<string, string> Answers, string Confidence, string ExtractorUsed, bool UsedAi, List<string> Warnings, bool ManualReviewRequired, string ManualReviewReason)
 { public string FileType => Path.GetExtension(SourceFileName).TrimStart('.').ToLowerInvariant(); }
 internal sealed record GradeRow(string AssignmentName, string StudentName, string SourceFileName, int CorrectCount, int TotalQuestions, double Percent, string GradingStatus, bool ManualReviewRequired, string ManualReviewReason, string Warnings, string ExtractionMethod, string Confidence, string FileType);
