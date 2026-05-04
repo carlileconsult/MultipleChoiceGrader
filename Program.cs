@@ -1,6 +1,6 @@
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 var argsResult = CliOptions.Parse(args);
 if (!argsResult.Success)
@@ -16,23 +16,16 @@ try
 {
     var appSettings = AppSettingsLoader.Load("appsettings.json");
     var runner = new JobRunner();
-    var summary = await runner.RunAsync(options, appSettings.Grading);
+    var summary = await runner.RunAsync(options, appSettings.Grading, appSettings.OpenAI);
 
     Console.WriteLine();
     Console.WriteLine("=== Job Summary ===");
-    Console.WriteLine($"Job path: {summary.RunConfiguration.JobPath ?? "(not set)"}");
-    Console.WriteLine($"Answer key path: {summary.RunConfiguration.AnswerKeyPath}");
-    Console.WriteLine($"Submissions path: {summary.RunConfiguration.SubmissionsPath}");
-    Console.WriteLine($"Results path: {summary.RunConfiguration.ResultsPath}");
-    Console.WriteLine($"Extracted JSON path: {summary.RunConfiguration.ExtractedJsonPath}");
-    Console.WriteLine($"Assignment name: {summary.AssignmentName}");
-    Console.WriteLine($"Submissions found: {summary.SubmissionCount}");
-    Console.WriteLine($"Graded: {summary.GradedCount}");
-    Console.WriteLine($"Need review: {summary.ReviewCount}");
-    Console.WriteLine("Reports:");
-    Console.WriteLine($"- {summary.GradeReportPath}");
-    Console.WriteLine($"- {summary.ReviewReportPath}");
-    Console.WriteLine($"- {summary.ExtractionSummaryPath}");
+    Console.WriteLine($"Processed: {summary.Processed}");
+    Console.WriteLine($"Graded: {summary.Graded}");
+    Console.WriteLine($"Manual review: {summary.ManualReview}");
+    Console.WriteLine($"OpenAI extraction failures: {summary.OpenAiExtractionFailures}");
+    Console.WriteLine($"Output report: {summary.GradeReportPath}");
+    Console.WriteLine($"Extracted answers folder: {summary.ExtractedAnswersFolder}");
 
     return 0;
 }
@@ -68,7 +61,7 @@ internal sealed record CliOptions(string? JobPath, string? AnswerKeyPath, string
         return ParseResult.Ok(new CliOptions(jobPath, answerKeyPath, submissionsPath, resultsPath, extractOnly, gradeOnly, useCache, forceReextract));
     }
 
-    public static void PrintUsage() => Console.WriteLine("Usage: dotnet run -- [--job <path>] [--answer-key <path>] [--submissions <path>] [--results <path>] [--extract-only] [--grade-only] [--use-cache] [--force-reextract]");
+    public static void PrintUsage() => Console.WriteLine("Usage: dotnet run -- [--job <path>] [--answer-key <path>] [--submissions <path>] [--results <path>]");
 }
 
 internal sealed record ParseResult(bool Success, CliOptions? Options, string ErrorMessage)
@@ -83,328 +76,218 @@ public sealed class GradingOptions
     public string? AnswerKeyPath { get; set; }
     public string? SubmissionsPath { get; set; }
     public string? ResultsPath { get; set; }
-    public List<string> SupportedExtensions { get; set; } = new() { ".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".heic" };
-    public bool EnableOcr { get; set; } = true;
-    public string OcrLanguage { get; set; } = "eng";
-    public bool UseCache { get; set; } = true;
+    public string? SingleFilePath { get; set; }
+    public string ExtractionMode { get; set; } = "Local";
+    public decimal ManualReviewConfidenceThreshold { get; set; } = 0.70m;
     public string? QuizId { get; set; }
 }
-
-public sealed class GradingRunConfiguration
-{
-    public string? JobPath { get; set; }
-    public string AnswerKeyPath { get; set; } = "";
-    public string SubmissionsPath { get; set; } = "";
-    public string ResultsPath { get; set; } = "";
-    public string ExtractedJsonPath { get; set; } = "";
-    public bool UseCache { get; set; }
-}
-
-internal sealed record AppSettings(GradingOptions Grading);
+public sealed class OpenAiOptions { public string? ApiKey { get; set; } public string Model { get; set; } = "gpt-4.1-mini"; }
+internal sealed record AppSettings(GradingOptions Grading, OpenAiOptions OpenAI);
 
 internal static class AppSettingsLoader
 {
     public static AppSettings Load(string path)
     {
-        if (!File.Exists(path)) return new AppSettings(new GradingOptions());
-        var json = File.ReadAllText(path);
-        using var doc = JsonDocument.Parse(json);
-        var grading = new GradingOptions();
-        if (doc.RootElement.TryGetProperty("Grading", out var g))
+        if (!File.Exists(path)) return new AppSettings(new GradingOptions(), new OpenAiOptions());
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        var g = new GradingOptions();
+        var o = new OpenAiOptions();
+        if (doc.RootElement.TryGetProperty("Grading", out var ge))
         {
-            grading.DefaultJobPath = ReadString(g, "DefaultJobPath");
-            grading.AnswerKeyPath = ReadString(g, "AnswerKeyPath");
-            grading.SubmissionsPath = ReadString(g, "SubmissionsPath");
-            grading.ResultsPath = ReadString(g, "ResultsPath");
-            grading.UseCache = ReadBool(g, "UseCache") ?? true;
-            grading.QuizId = ReadString(g, "QuizId");
-            grading.EnableOcr = ReadBool(g, "EnableOcr") ?? true;
-            grading.OcrLanguage = ReadString(g, "OcrLanguage") ?? "eng";
-            if (g.TryGetProperty("SupportedExtensions", out var exts) && exts.ValueKind == JsonValueKind.Array)
-            {
-                grading.SupportedExtensions = exts.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString()!).Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
-            }
+            g.DefaultJobPath = ReadString(ge, "DefaultJobPath");
+            g.AnswerKeyPath = ReadString(ge, "AnswerKeyPath");
+            g.SubmissionsPath = ReadString(ge, "SubmissionsPath") ?? ReadString(ge, "SubmissionsFolder");
+            g.ResultsPath = ReadString(ge, "ResultsPath") ?? ReadString(ge, "OutputFolder");
+            g.QuizId = ReadString(ge, "QuizId");
+            g.SingleFilePath = ReadString(ge, "SingleFilePath");
+            g.ExtractionMode = ReadString(ge, "ExtractionMode") ?? "Local";
+            g.ManualReviewConfidenceThreshold = ReadDecimal(ge, "ManualReviewConfidenceThreshold") ?? 0.70m;
         }
-        return new AppSettings(grading);
-    }
-
-    private static string? ReadString(JsonElement element, string name) => element.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
-    private static bool? ReadBool(JsonElement element, string name) => element.TryGetProperty(name, out var p) && (p.ValueKind is JsonValueKind.True or JsonValueKind.False) ? p.GetBoolean() : null;
-}
-
-public sealed class SubmissionContent { public string FilePath { get; set; } = ""; public string FileName { get; set; } = ""; public string FileType { get; set; } = ""; public string ExtractedText { get; set; } = ""; public List<string> ExtractedImagePaths { get; set; } = new(); public List<string> Warnings { get; set; } = new(); public string ExtractionMethod { get; set; } = "Failed"; }
-public interface ISubmissionContentExtractor { bool CanHandle(string filePath); Task<SubmissionContent> ExtractAsync(string filePath, CancellationToken cancellationToken = default); }
-public interface IOcrService { Task<string> ExtractTextAsync(string imagePath, CancellationToken cancellationToken = default); }
-public sealed class StubOcrService(bool enableOcr) : IOcrService { public Task<string> ExtractTextAsync(string imagePath, CancellationToken cancellationToken = default) => Task.FromResult(enableOcr ? string.Empty : string.Empty); }
-
-public sealed class ExtractorRouter
-{
-    private readonly IReadOnlyList<ISubmissionContentExtractor> _extractors;
-    public ExtractorRouter(IEnumerable<ISubmissionContentExtractor> extractors) => _extractors = extractors.ToList();
-    public ISubmissionContentExtractor? Resolve(string path) => _extractors.FirstOrDefault(x => x.CanHandle(path));
-}
-
-public sealed class PdfSubmissionContentExtractor(IOcrService ocr, bool enableOcr) : ISubmissionContentExtractor
-{
-    public bool CanHandle(string filePath) => string.Equals(Path.GetExtension(filePath), ".pdf", StringComparison.OrdinalIgnoreCase);
-    public async Task<SubmissionContent> ExtractAsync(string filePath, CancellationToken cancellationToken = default)
-    {
-        var content = Base(filePath, "pdf", "DirectText");
-        content.Warnings.Add("Direct PDF text extraction library is not configured in this build.");
-        if (enableOcr)
+        if (doc.RootElement.TryGetProperty("OpenAI", out var oe))
         {
-            content.ExtractionMethod = "PdfOcr";
-            content.Warnings.Add("PDF OCR fallback requested, but PDF rendering is unavailable; manual review recommended.");
-            content.ExtractedText = await ocr.ExtractTextAsync(filePath, cancellationToken);
+            o.ApiKey = ReadString(oe, "ApiKey");
+            o.Model = ReadString(oe, "Model") ?? "gpt-4.1-mini";
         }
-        return content;
+        return new AppSettings(g, o);
     }
-    private static SubmissionContent Base(string filePath, string type, string method) => new() { FilePath = filePath, FileName = Path.GetFileName(filePath), FileType = type, ExtractionMethod = method };
+    private static string? ReadString(JsonElement e, string n) => e.TryGetProperty(n, out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
+    private static decimal? ReadDecimal(JsonElement e, string n) => e.TryGetProperty(n, out var p) && p.TryGetDecimal(out var d) ? d : null;
 }
-public sealed class WordSubmissionContentExtractor : ISubmissionContentExtractor
+
+public interface IAnswerExtractionService { Task<ExtractedSubmissionAnswers> ExtractAnswersAsync(string filePath, QuizAnswerKey answerKey, CancellationToken cancellationToken = default); }
+public sealed class OpenAiAnswerExtractionService(OpenAiOptions options, HttpClient? httpClient = null) : IAnswerExtractionService
 {
-    public bool CanHandle(string filePath) => new[] { ".docx", ".doc" }.Contains(Path.GetExtension(filePath), StringComparer.OrdinalIgnoreCase);
-    public Task<SubmissionContent> ExtractAsync(string filePath, CancellationToken cancellationToken = default)
+    private readonly HttpClient _http = httpClient ?? new HttpClient();
+    public async Task<ExtractedSubmissionAnswers> ExtractAnswersAsync(string filePath, QuizAnswerKey answerKey, CancellationToken cancellationToken = default)
     {
+        var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? options.ApiKey;
+        if (string.IsNullOrWhiteSpace(apiKey)) return Fail(filePath, "ExtractionMode is OpenAI but OPENAI_API_KEY is not configured.");
         var ext = Path.GetExtension(filePath).ToLowerInvariant();
-        var result = new SubmissionContent { FilePath = filePath, FileName = Path.GetFileName(filePath), FileType = ext.TrimStart('.'), ExtractionMethod = "WordText" };
-        if (ext == ".doc") result.Warnings.Add(".doc extraction is not supported in this build; please convert to .docx or PDF.");
-        else result.Warnings.Add(".docx text extraction library is not configured in this build.");
-        return Task.FromResult(result);
+        if (ext == ".heic") return Fail(filePath, "HEIC conversion is not available. Convert to JPG or PNG and rerun.", "HEIC conversion is not available. Convert to JPG or PNG and rerun.");
+        if (!new[] { ".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg" }.Contains(ext)) return Fail(filePath, "Unsupported file type.");
+
+        var content = ext is ".doc" or ".docx" ? await File.ReadAllTextAsync(filePath, cancellationToken) : Convert.ToBase64String(await File.ReadAllBytesAsync(filePath, cancellationToken));
+        var prompt = PromptBuilder.Build(answerKey);
+        var payload = JsonSerializer.Serialize(new { model = options.Model, input = new object[] { new { role = "system", content = new object[] { new { type = "input_text", text = prompt } } }, new { role = "user", content = new object[] { new { type = "input_text", text = $"fileName={Path.GetFileName(filePath)}; fileType={ext}; payload={content}" } } } } });
+        using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.openai.com/v1/responses");
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+        var resp = await _http.SendAsync(req, cancellationToken);
+        if (!resp.IsSuccessStatusCode) return Fail(filePath, $"OpenAI request failed: {(int)resp.StatusCode}");
+        var text = await resp.Content.ReadAsStringAsync(cancellationToken);
+        if (!TryExtractJson(text, out var extracted)) return Fail(filePath, "OpenAI returned invalid JSON.");
+        Normalize(extracted!, Path.GetFileName(filePath), answerKey);
+        return extracted!;
     }
-}
-public sealed class ImageSubmissionContentExtractor(IOcrService ocr, bool enableOcr) : ISubmissionContentExtractor
-{
-    private static readonly HashSet<string> Exts = new(StringComparer.OrdinalIgnoreCase) { ".png", ".jpg", ".jpeg" };
-    public bool CanHandle(string filePath) => Exts.Contains(Path.GetExtension(filePath));
-    public async Task<SubmissionContent> ExtractAsync(string filePath, CancellationToken cancellationToken = default)
+    private static bool TryExtractJson(string responseJson, out ExtractedSubmissionAnswers? result)
     {
-        var result = new SubmissionContent { FilePath = filePath, FileName = Path.GetFileName(filePath), FileType = Path.GetExtension(filePath).TrimStart('.'), ExtractionMethod = "ImageOcr" };
-        if (!enableOcr) result.Warnings.Add("OCR disabled; no text extracted from image.");
-        else result.ExtractedText = await ocr.ExtractTextAsync(filePath, cancellationToken);
-        return result;
+        result = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(responseJson);
+            var outputText = doc.RootElement.GetProperty("output")[0].GetProperty("content")[0].GetProperty("text").GetString() ?? "";
+            result = JsonSerializer.Deserialize<ExtractedSubmissionAnswers>(outputText, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            return result is not null;
+        }
+        catch { return false; }
     }
-}
-public sealed class HeicSubmissionContentExtractor(IOcrService ocr, bool enableOcr) : ISubmissionContentExtractor
-{
-    public bool CanHandle(string filePath) => string.Equals(Path.GetExtension(filePath), ".heic", StringComparison.OrdinalIgnoreCase);
-    public async Task<SubmissionContent> ExtractAsync(string filePath, CancellationToken cancellationToken = default)
+    private static void Normalize(ExtractedSubmissionAnswers r, string fileName, QuizAnswerKey key)
     {
-        var result = new SubmissionContent { FilePath = filePath, FileName = Path.GetFileName(filePath), FileType = "heic", ExtractionMethod = "HeicConvertedOcr" };
-        result.Warnings.Add("HEIC conversion is platform-dependent and not available in this build; manual review recommended.");
-        if (enableOcr) result.ExtractedText = await ocr.ExtractTextAsync(filePath, cancellationToken);
-        return result;
+        r.FileName = fileName; r.ExtractionProvider = "OpenAI";
+        foreach (var a in r.Answers)
+        {
+            a.SelectedChoice = string.IsNullOrWhiteSpace(a.SelectedChoice) ? null : a.SelectedChoice.Trim().ToLowerInvariant();
+            if (a.SelectedChoice is not ("a" or "b" or "c" or "d")) a.SelectedChoice = null;
+            if (a.SelectedChoice is null) { a.Confidence = 0; a.NeedsManualReview = true; }
+        }
+        foreach (var q in key.Answers.Where(x => r.Answers.All(a => a.QuestionNumber != x.QuestionNumber)))
+            r.Answers.Add(new ExtractedAnswer { QuestionNumber = q.QuestionNumber, SelectedChoice = null, Confidence = 0, NeedsManualReview = true, Evidence = "Missing in model output" });
     }
+    private static ExtractedSubmissionAnswers Fail(string filePath, string reason, string? warning = null) => new() { FileName = Path.GetFileName(filePath), ExtractionProvider = "OpenAI", Success = false, FailureReason = reason, Warnings = warning is null ? new() : new() { warning } };
 }
+
+public static class PromptBuilder { public static string Build(QuizAnswerKey answerKey) => $"""
+You are extracting answers from a student's multiple-choice quiz submission.
+Do not grade the quiz.
+Do not decide whether answers are correct.
+Only identify the answer choice selected by the student for each question.
+Return one answer object for every question in the answer key.
+If an answer is blank, unclear, crossed out, or unreadable: selectedChoice=null, confidence=0, needsManualReview=true.
+Valid selected choices are: a, b, c, d. Normalize uppercase to lowercase.
+Use provided answer key only for question numbers.
+Do not use correctChoice to infer student's answer.
+If submission appears to be answer key add warning: Submission may be an answer key, not a student response.
+Question numbers: {string.Join(',', answerKey.Answers.Select(a => a.QuestionNumber))}
+Return JSON matching ExtractedSubmissionAnswers.
+"""; }
+
+public class ExtractedSubmissionAnswers { public string FileName { get; set; } = ""; public string ExtractionProvider { get; set; } = ""; public bool Success { get; set; } = true; public string? FailureReason { get; set; } public List<ExtractedAnswer> Answers { get; set; } = new(); public List<string> Warnings { get; set; } = new(); }
+public class ExtractedAnswer { public int QuestionNumber { get; set; } public string? SelectedChoice { get; set; } public decimal Confidence { get; set; } public string? Evidence { get; set; } public bool NeedsManualReview { get; set; } }
+public sealed class QuestionGrade { public int QuestionNumber { get; set; } public string? Selected { get; set; } public string Correct { get; set; } = ""; public string Result { get; set; } = "Incorrect"; public decimal Confidence { get; set; } }
+public sealed class SubmissionGradeResult { public string FileName { get; set; } = ""; public string FileType { get; set; } = ""; public string GradingStatus { get; set; } = "Graded"; public int Score { get; set; } public int TotalQuestions { get; set; } public decimal Percent { get; set; } public bool ManualReviewRequired { get; set; } public string ManualReviewReason { get; set; } = ""; public string Warnings { get; set; } = ""; public string ExtractionProvider { get; set; } = ""; public string ExtractedAnswersFilePath { get; set; } = ""; public List<QuestionGrade> QuestionGrades { get; set; } = new(); }
 
 internal sealed class JobRunner
 {
-    public async Task<JobRunSummary> RunAsync(CliOptions options, GradingOptions gradingOptions)
+    public async Task<JobSummary> RunAsync(CliOptions options, GradingOptions gradingOptions, OpenAiOptions openAiOptions)
     {
         var runConfig = JobContext.Resolve(options, gradingOptions);
-        var answerKey = AnswerKeyLoader.Load(runConfig.AnswerKeyPath, gradingOptions.QuizId);
-        var submissions = Directory.GetFiles(runConfig.SubmissionsPath).OrderBy(Path.GetFileName).ToList();
-
-        var ocr = new StubOcrService(gradingOptions.EnableOcr);
-        var router = new ExtractorRouter(new ISubmissionContentExtractor[] { new PdfSubmissionContentExtractor(ocr, gradingOptions.EnableOcr), new WordSubmissionContentExtractor(), new ImageSubmissionContentExtractor(ocr, gradingOptions.EnableOcr), new HeicSubmissionContentExtractor(ocr, gradingOptions.EnableOcr) });
-        var supported = new HashSet<string>(gradingOptions.SupportedExtensions.Select(x => x.StartsWith('.') ? x.ToLowerInvariant() : $".{x.ToLowerInvariant()}"));
-
-        var extracted = new List<ExtractedSubmission>();
-        foreach (var file in submissions)
+        var selectedQuiz = AnswerKeyLoader.LoadQuiz(runConfig.AnswerKeyPath, gradingOptions.QuizId);
+        var extraction = ResolveExtractionService(gradingOptions, openAiOptions);
+        var files = runConfig.SingleFilePath is not null ? new List<string> { runConfig.SingleFilePath } : Directory.GetFiles(runConfig.SubmissionsPath).OrderBy(Path.GetFileName).ToList();
+        var extractedDir = Path.Combine(runConfig.ResultsPath, "extracted-answers"); Directory.CreateDirectory(extractedDir);
+        var results = new List<SubmissionGradeResult>(); int openAiFailures = 0;
+        foreach (var file in files)
         {
-            Console.WriteLine($"File discovered: {Path.GetFileName(file)}");
-            try
-            {
-                var ext = Path.GetExtension(file).ToLowerInvariant();
-                if (!supported.Contains(ext))
-                {
-                    Console.WriteLine($"Warning: Unsupported file skipped: {file}");
-                    extracted.Add(new ExtractedSubmission(Path.GetFileName(file), "", new(), "low", "Unsupported", false, new() { "Unsupported file type." }, true, "Unsupported file type."));
-                    continue;
-                }
-
-                var extractor = router.Resolve(file);
-                if (extractor is null)
-                {
-                    extracted.Add(new ExtractedSubmission(Path.GetFileName(file), "", new(), "low", "Unsupported", false, new() { "No extractor available." }, true, "No extractor available."));
-                    continue;
-                }
-
-                Console.WriteLine($"Extractor selected: {extractor.GetType().Name}");
-                var content = await extractor.ExtractAsync(file);
-                var answers = ParseAnswers(content.ExtractedText);
-                var student = ParseStudent(content.ExtractedText) ?? Path.GetFileNameWithoutExtension(file);
-                var manualReview = string.IsNullOrWhiteSpace(content.ExtractedText) || content.ExtractedText.Trim().Length < 3;
-                var reason = manualReview ? "No readable text could be extracted from submission." : "";
-                if (manualReview) Console.WriteLine($"Submission marked for manual review: {content.FileName}");
-                extracted.Add(new ExtractedSubmission(content.FileName, student, answers, manualReview ? "low" : "medium", content.ExtractionMethod, content.ExtractionMethod.Contains("Ocr"), content.Warnings, manualReview, reason));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error processing {file}: {ex.Message}");
-                extracted.Add(new ExtractedSubmission(Path.GetFileName(file), "", new(), "low", "Failed", false, new() { ex.Message }, true, "Failed to process submission."));
-            }
+            var ex = await extraction.ExtractAnswersAsync(file, selectedQuiz);
+            if (!ex.Success) openAiFailures++;
+            var graded = GradeSubmission(ex, selectedQuiz, gradingOptions.ManualReviewConfidenceThreshold);
+            var debugPath = Path.Combine(extractedDir, $"{Path.GetFileNameWithoutExtension(file)}.json");
+            graded.ExtractedAnswersFilePath = debugPath;
+            await File.WriteAllTextAsync(debugPath, JsonSerializer.Serialize(new { ex.FileName, ex.ExtractionProvider, ex.Success, ex.FailureReason, ex.Warnings, ex.Answers, graded.QuestionGrades }, new JsonSerializerOptions { WriteIndented = true }));
+            results.Add(graded);
         }
-
-        var gradeRows = extracted.Select(e => Grade(answerKey, e)).ToList();
-        var extractionSummaryPath = Path.Combine(runConfig.ResultsPath, "extraction-summary.csv");
-        var gradePath = Path.Combine(runConfig.ResultsPath, "grade-report.csv");
-        var reviewPath = Path.Combine(runConfig.ResultsPath, "review-needed.csv");
-        CsvWriter.WriteExtractionSummary(extractionSummaryPath, extracted);
-        CsvWriter.WriteGradeReport(gradePath, gradeRows);
-        CsvWriter.WriteReviewReport(reviewPath, gradeRows.Where(x => x.ManualReviewRequired).ToList());
-
-        return new JobRunSummary(runConfig, answerKey.AssignmentName, submissions.Count, gradeRows.Count, gradeRows.Count(x => x.ManualReviewRequired), gradePath, reviewPath, extractionSummaryPath);
+        var reportPath = Path.Combine(runConfig.ResultsPath, "grade-report.csv");
+        CsvWriter.WriteGradeReport(reportPath, results, selectedQuiz.Answers.Select(a => a.QuestionNumber).ToList());
+        return new JobSummary(files.Count, results.Count(r => !r.ManualReviewRequired), results.Count(r => r.ManualReviewRequired), openAiFailures, reportPath, extractedDir);
     }
-
-    private static GradeRow Grade(AnswerKey key, ExtractedSubmission sub)
+    private static IAnswerExtractionService ResolveExtractionService(GradingOptions options, OpenAiOptions openAiOptions)
     {
-        if (sub.ManualReviewRequired) return new GradeRow(key.AssignmentName, sub.StudentName, sub.SourceFileName, 0, key.Questions.Count, 0, "ManualReview", true, sub.ManualReviewReason, string.Join(" | ", sub.Warnings), sub.ExtractorUsed, sub.Confidence, sub.FileType);
-        var correct = key.Questions.Count(q => sub.Answers.TryGetValue(q.Key, out var a) && string.Equals(a, q.Value, StringComparison.OrdinalIgnoreCase));
-        var percent = key.Questions.Count == 0 ? 0 : (double)correct / key.Questions.Count * 100;
-        return new GradeRow(key.AssignmentName, sub.StudentName, sub.SourceFileName, correct, key.Questions.Count, percent, "Graded", false, "", string.Join(" | ", sub.Warnings), sub.ExtractorUsed, sub.Confidence, sub.FileType);
+        if (string.Equals(options.ExtractionMode, "OpenAI", StringComparison.OrdinalIgnoreCase)) return new OpenAiAnswerExtractionService(openAiOptions);
+        throw new InvalidOperationException("Only OpenAI extraction mode is implemented in this build.");
     }
-
-    private static Dictionary<string, string> ParseAnswers(string text)
+    internal static SubmissionGradeResult GradeSubmission(ExtractedSubmissionAnswers extracted, QuizAnswerKey key, decimal threshold)
     {
-        var matches = Regex.Matches(text ?? "", @"(?m)^\s*(\d+)\s*[:\-]\s*([A-Za-z])\s*$");
-        return matches.ToDictionary(m => m.Groups[1].Value, m => m.Groups[2].Value.ToUpperInvariant());
-    }
-    private static string? ParseStudent(string text) { var m = Regex.Match(text ?? "", @"(?im)^\s*name\s*[:\-]\s*(.+)$"); return m.Success ? m.Groups[1].Value.Trim() : null; }
-}
-
-internal static class JobContext
-{
-    public static GradingRunConfiguration Resolve(CliOptions cli, GradingOptions config)
-    {
-        var jobPath = !string.IsNullOrWhiteSpace(cli.JobPath) ? ResolvePath(cli.JobPath!) : (!string.IsNullOrWhiteSpace(config.DefaultJobPath) ? ResolvePath(config.DefaultJobPath!) : null);
-        var answerKeyPath = FirstPath(cli.AnswerKeyPath, config.AnswerKeyPath, jobPath is null ? null : Path.Combine(jobPath, "answer-key.json")) ?? throw new InvalidOperationException("Answer key path required.");
-        var submissionsPath = FirstPath(cli.SubmissionsPath, config.SubmissionsPath, jobPath is null ? null : Path.Combine(jobPath, "submissions")) ?? throw new InvalidOperationException("Submissions path required.");
-        var resultsPath = FirstPath(cli.ResultsPath, config.ResultsPath, jobPath is null ? null : Path.Combine(jobPath, "results")) ?? throw new InvalidOperationException("Results path required.");
-        if (!File.Exists(answerKeyPath)) throw new InvalidOperationException($"Answer key file not found: {answerKeyPath}");
-        if (!Directory.Exists(submissionsPath)) throw new InvalidOperationException($"Submissions folder not found: {submissionsPath}");
-        Directory.CreateDirectory(resultsPath);
-        var extractedJsonPath = Path.Combine(resultsPath, "extracted-json");
-        Directory.CreateDirectory(extractedJsonPath);
-        return new GradingRunConfiguration { JobPath = jobPath, AnswerKeyPath = answerKeyPath, SubmissionsPath = submissionsPath, ResultsPath = resultsPath, ExtractedJsonPath = extractedJsonPath, UseCache = cli.UseCache || (!cli.ForceReextract && config.UseCache) };
-    }
-    private static string? FirstPath(params string?[] candidates) => candidates.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) is { } v ? ResolvePath(v) : null;
-    private static string ResolvePath(string path) => Path.IsPathRooted(path) ? path : Path.GetFullPath(path);
-}
-
-internal sealed record AnswerKey(string AssignmentName, Dictionary<string, string> Questions);
-public sealed class AnswerKeyFile
-{
-    public List<QuizAnswerKey> AnswerKeys { get; set; } = new();
-}
-
-public sealed class QuizAnswerKey
-{
-    public string QuizId { get; set; } = "";
-    public string Title { get; set; } = "";
-    public string? Source { get; set; }
-    public string? Section { get; set; }
-    public string? Chapter { get; set; }
-    public List<AnswerKeyItem> Answers { get; set; } = new();
-}
-
-public sealed class AnswerKeyItem
-{
-    public int QuestionNumber { get; set; }
-    public string CorrectChoice { get; set; } = "";
-    public string? AnswerText { get; set; }
-}
-
-internal static class AnswerKeyLoader
-{
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
-
-    public static AnswerKey Load(string path, string? configuredQuizId)
-    {
-        var json = File.ReadAllText(path);
-        try
+        var r = new SubmissionGradeResult { FileName = extracted.FileName, FileType = Path.GetExtension(extracted.FileName).TrimStart('.'), ExtractionProvider = extracted.ExtractionProvider, Warnings = string.Join(" | ", extracted.Warnings), TotalQuestions = key.Answers.Count };
+        if (!extracted.Success) { r.ManualReviewRequired = true; r.ManualReviewReason = extracted.FailureReason ?? "Extraction failed."; r.GradingStatus = "ManualReview"; return r; }
+        foreach (var q in key.Answers.OrderBy(x => x.QuestionNumber))
         {
-            if (TryLoadLegacy(json, out var legacy)) return legacy!;
-
-            var quizzes = LoadQuizzes(json);
-            ValidateAndNormalize(quizzes);
-            var selected = SelectQuiz(quizzes, configuredQuizId);
-            return new AnswerKey(string.IsNullOrWhiteSpace(selected.Title) ? selected.QuizId : selected.Title, selected.Answers.ToDictionary(a => a.QuestionNumber.ToString(), a => a.CorrectChoice));
+            var a = extracted.Answers.FirstOrDefault(x => x.QuestionNumber == q.QuestionNumber) ?? new ExtractedAnswer { QuestionNumber = q.QuestionNumber, NeedsManualReview = true };
+            var manual = a.SelectedChoice is null || a.Confidence < threshold || a.NeedsManualReview;
+            var result = manual ? "ManualReview" : (string.Equals(a.SelectedChoice, q.CorrectChoice, StringComparison.OrdinalIgnoreCase) ? "Correct" : "Incorrect");
+            r.QuestionGrades.Add(new QuestionGrade { QuestionNumber = q.QuestionNumber, Selected = a.SelectedChoice, Correct = q.CorrectChoice, Result = result, Confidence = a.Confidence });
+            if (result == "Correct") r.Score++;
         }
-        catch (JsonException ex)
-        {
-            throw new InvalidOperationException($"Invalid answer key JSON in '{path}': {ex.Message}", ex);
-        }
-        catch (InvalidOperationException ex)
-        {
-            throw new InvalidOperationException($"Invalid answer key file '{path}': {ex.Message}", ex);
-        }
-    }
-
-    private static bool TryLoadLegacy(string json, out AnswerKey? answerKey)
-    {
-        answerKey = JsonSerializer.Deserialize<AnswerKey>(json, JsonOptions);
-        return answerKey is not null && !string.IsNullOrWhiteSpace(answerKey.AssignmentName) && answerKey.Questions is not null && answerKey.Questions.Count > 0;
-    }
-
-    private static List<QuizAnswerKey> LoadQuizzes(string json)
-    {
-        var combined = JsonSerializer.Deserialize<AnswerKeyFile>(json, JsonOptions);
-        if (combined?.AnswerKeys?.Count > 0) return combined.AnswerKeys;
-
-        var single = JsonSerializer.Deserialize<QuizAnswerKey>(json, JsonOptions);
-        if (single is not null && (!string.IsNullOrWhiteSpace(single.QuizId) || single.Answers.Count > 0)) return new List<QuizAnswerKey> { single };
-
-        throw new InvalidOperationException("Could not parse answer key as legacy format, single quiz format, or combined answerKeys format.");
-    }
-
-    private static void ValidateAndNormalize(List<QuizAnswerKey> quizzes)
-    {
-        if (quizzes.Count == 0) throw new InvalidOperationException("No quizzes were found in the answer key file.");
-        foreach (var quiz in quizzes)
-        {
-            if (string.IsNullOrWhiteSpace(quiz.QuizId)) throw new InvalidOperationException("Each quiz must include quizId.");
-            if (quiz.Answers.Count == 0) throw new InvalidOperationException($"Quiz '{quiz.QuizId}' has no answers.");
-            foreach (var answer in quiz.Answers)
-            {
-                if (answer.QuestionNumber <= 0) throw new InvalidOperationException($"Quiz '{quiz.QuizId}' has an invalid questionNumber '{answer.QuestionNumber}'.");
-                if (string.IsNullOrWhiteSpace(answer.CorrectChoice)) throw new InvalidOperationException($"Quiz '{quiz.QuizId}' question {answer.QuestionNumber} is missing correctChoice.");
-                answer.CorrectChoice = answer.CorrectChoice.Trim().ToLowerInvariant();
-            }
-        }
-    }
-
-    private static QuizAnswerKey SelectQuiz(List<QuizAnswerKey> quizzes, string? configuredQuizId)
-    {
-        if (quizzes.Count == 1) return quizzes[0];
-        var available = string.Join(Environment.NewLine, quizzes.Select(x => $"- {x.QuizId}"));
-        if (string.IsNullOrWhiteSpace(configuredQuizId))
-            throw new InvalidOperationException($"Multiple answer keys were found. Please set Grading:QuizId in appsettings.json.{Environment.NewLine}Available quizIds:{Environment.NewLine}{available}");
-        var selected = quizzes.FirstOrDefault(x => string.Equals(x.QuizId, configuredQuizId, StringComparison.OrdinalIgnoreCase));
-        if (selected is null)
-            throw new InvalidOperationException($"Grading:QuizId '{configuredQuizId}' was not found.{Environment.NewLine}Available quizIds:{Environment.NewLine}{available}");
-        return selected;
+        r.ManualReviewRequired = r.QuestionGrades.Any(x => x.Result == "ManualReview");
+        r.ManualReviewReason = r.ManualReviewRequired ? "One or more questions require manual review." : "";
+        r.GradingStatus = r.ManualReviewRequired ? "ManualReview" : "Graded";
+        r.Percent = r.TotalQuestions == 0 ? 0 : (decimal)r.Score / r.TotalQuestions * 100;
+        return r;
     }
 }
-internal sealed record ExtractedSubmission(string SourceFileName, string StudentName, Dictionary<string, string> Answers, string Confidence, string ExtractorUsed, bool UsedAi, List<string> Warnings, bool ManualReviewRequired, string ManualReviewReason)
-{ public string FileType => Path.GetExtension(SourceFileName).TrimStart('.').ToLowerInvariant(); }
-internal sealed record GradeRow(string AssignmentName, string StudentName, string SourceFileName, int CorrectCount, int TotalQuestions, double Percent, string GradingStatus, bool ManualReviewRequired, string ManualReviewReason, string Warnings, string ExtractionMethod, string Confidence, string FileType);
-internal sealed record JobRunSummary(GradingRunConfiguration RunConfiguration, string AssignmentName, int SubmissionCount, int GradedCount, int ReviewCount, string GradeReportPath, string ReviewReportPath, string ExtractionSummaryPath);
 
 internal static class CsvWriter
 {
-    public static void WriteGradeReport(string path, List<GradeRow> rows)
+    public static void WriteGradeReport(string path, List<SubmissionGradeResult> rows, List<int> questionNumbers)
     {
-        var sb = new StringBuilder("FileName,FileType,GradingStatus,Score,ManualReviewRequired,ManualReviewReason,Warnings,ExtractionMethod\n");
-        foreach (var r in rows) sb.AppendLine(string.Join(',', Esc(r.SourceFileName), Esc(r.FileType), Esc(r.GradingStatus), r.Percent.ToString("F2"), r.ManualReviewRequired, Esc(r.ManualReviewReason), Esc(r.Warnings), Esc(r.ExtractionMethod)));
-        File.WriteAllText(path, sb.ToString());
-    }
-    public static void WriteReviewReport(string path, List<GradeRow> rows) => WriteGradeReport(path, rows);
-    public static void WriteExtractionSummary(string path, List<ExtractedSubmission> rows)
-    {
-        var sb = new StringBuilder("SourceFileName,ExtractorUsed,ManualReviewRequired,Warnings\n");
-        foreach (var r in rows) sb.AppendLine(string.Join(',', Esc(r.SourceFileName), Esc(r.ExtractorUsed), r.ManualReviewRequired, Esc(string.Join(" | ", r.Warnings))));
+        var sb = new StringBuilder("FileName,FileType,GradingStatus,Score,TotalQuestions,Percent,ManualReviewRequired,ManualReviewReason,Warnings,ExtractionProvider,ExtractedAnswersFilePath");
+        foreach (var q in questionNumbers) sb.Append($",Q{q}_Selected,Q{q}_Correct,Q{q}_Result,Q{q}_Confidence");
+        sb.AppendLine();
+        foreach (var r in rows)
+        {
+            var cells = new List<string> { Esc(r.FileName), Esc(r.FileType), Esc(r.GradingStatus), r.Score.ToString(), r.TotalQuestions.ToString(), r.Percent.ToString("F2"), r.ManualReviewRequired.ToString().ToLowerInvariant(), Esc(r.ManualReviewReason), Esc(r.Warnings), Esc(r.ExtractionProvider), Esc(r.ExtractedAnswersFilePath) };
+            foreach (var q in questionNumbers)
+            {
+                var g = r.QuestionGrades.FirstOrDefault(x => x.QuestionNumber == q);
+                cells.Add(Esc(g?.Selected ?? "")); cells.Add(Esc(g?.Correct ?? "")); cells.Add(Esc(g?.Result ?? "")); cells.Add((g?.Confidence ?? 0).ToString("F2"));
+            }
+            sb.AppendLine(string.Join(',', cells));
+        }
         File.WriteAllText(path, sb.ToString());
     }
     private static string Esc(string s) => $"\"{(s ?? "").Replace("\"", "\"\"")}\"";
 }
+
+internal sealed record GradingRunConfiguration(string AnswerKeyPath, string SubmissionsPath, string ResultsPath, string? SingleFilePath);
+internal static class JobContext
+{
+    public static GradingRunConfiguration Resolve(CliOptions cli, GradingOptions config)
+    {
+        var answerKeyPath = ResolvePath(cli.AnswerKeyPath ?? config.AnswerKeyPath ?? throw new InvalidOperationException("Answer key path required."));
+        var submissionsPath = ResolvePath(cli.SubmissionsPath ?? config.SubmissionsPath ?? throw new InvalidOperationException("Submissions path required."));
+        var resultsPath = ResolvePath(cli.ResultsPath ?? config.ResultsPath ?? throw new InvalidOperationException("Results path required."));
+        Directory.CreateDirectory(resultsPath);
+        var singleFile = string.IsNullOrWhiteSpace(config.SingleFilePath) ? null : ResolvePath(config.SingleFilePath!);
+        return new GradingRunConfiguration(answerKeyPath, submissionsPath, resultsPath, singleFile);
+    }
+    private static string ResolvePath(string p) => Path.IsPathRooted(p) ? p : Path.GetFullPath(p);
+}
+
+internal sealed record AnswerKey(string AssignmentName, Dictionary<string, string> Questions);
+public sealed class AnswerKeyFile { public List<QuizAnswerKey> AnswerKeys { get; set; } = new(); }
+public sealed class QuizAnswerKey { public string QuizId { get; set; } = ""; public string Title { get; set; } = ""; public List<AnswerKeyItem> Answers { get; set; } = new(); }
+public sealed class AnswerKeyItem { public int QuestionNumber { get; set; } public string CorrectChoice { get; set; } = ""; }
+internal static class AnswerKeyLoader
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    public static AnswerKey Load(string path, string? configuredQuizId) { var q = LoadQuiz(path, configuredQuizId); return new AnswerKey(string.IsNullOrWhiteSpace(q.Title) ? q.QuizId : q.Title, q.Answers.ToDictionary(a => a.QuestionNumber.ToString(), a => a.CorrectChoice)); }
+    public static QuizAnswerKey LoadQuiz(string path, string? configuredQuizId)
+    {
+        var json = File.ReadAllText(path);
+        var combined = JsonSerializer.Deserialize<AnswerKeyFile>(json, JsonOptions);
+        var quizzes = combined?.AnswerKeys?.Count > 0 ? combined.AnswerKeys : new List<QuizAnswerKey> { JsonSerializer.Deserialize<QuizAnswerKey>(json, JsonOptions)! };
+        quizzes = quizzes.Where(x => x is not null).ToList();
+        foreach (var q in quizzes) foreach (var a in q.Answers) a.CorrectChoice = a.CorrectChoice.Trim().ToLowerInvariant();
+        return quizzes.Count == 1 ? quizzes[0] : quizzes.First(x => x.QuizId.Equals(configuredQuizId, StringComparison.OrdinalIgnoreCase));
+    }
+}
+internal sealed record JobSummary(int Processed, int Graded, int ManualReview, int OpenAiExtractionFailures, string GradeReportPath, string ExtractedAnswersFolder);
