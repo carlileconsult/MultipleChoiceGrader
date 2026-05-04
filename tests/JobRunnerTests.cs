@@ -4,19 +4,21 @@ using Xunit;
 public class JobRunnerTests
 {
     [Fact]
-    public async Task EmptyTextSubmission_IsManualReview()
+    public async Task SingleFilePath_ProcessesOnlyOneFile_AndWritesDebugJson()
     {
+        Environment.SetEnvironmentVariable("OPENAI_API_KEY", null);
         var root = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         var sub = Path.Combine(root, "subs"); Directory.CreateDirectory(sub);
         var res = Path.Combine(root, "results");
         var keyPath = Path.Combine(root, "answer-key.json");
-        await File.WriteAllTextAsync(Path.Combine(sub, "s.doc"), "");
-        await File.WriteAllTextAsync(keyPath, JsonSerializer.Serialize(new { assignmentName = "A1", questions = new Dictionary<string, string>{{"1","A"}} }));
+        var f1 = Path.Combine(sub, "s1.jpg"); var f2 = Path.Combine(sub, "s2.jpg");
+        await File.WriteAllTextAsync(f1, "x"); await File.WriteAllTextAsync(f2, "x");
+        await File.WriteAllTextAsync(keyPath, JsonSerializer.Serialize(new { quizId = "Q1", title = "Q1", answers = new[] { new { questionNumber = 1, correctChoice = "a" } } }));
 
         var runner = new JobRunner();
-        var summary = await runner.RunAsync(new CliOptions(null, keyPath, sub, res, false, false, false, false), new GradingOptions());
-        var reviewCsv = await File.ReadAllTextAsync(summary.ReviewReportPath);
-        Assert.Contains("true", reviewCsv);
+        var summary = await runner.RunAsync(new CliOptions(null, keyPath, sub, res, false, false, false, false), new GradingOptions { SingleFilePath = f1, ExtractionMode = "OpenAI", ManualReviewConfidenceThreshold = 0.7m }, new OpenAiOptions());
+        Assert.Equal(1, summary.Processed);
+        Assert.True(Directory.GetFiles(summary.ExtractedAnswersFolder, "*.json").Length >= 1);
     }
 }
