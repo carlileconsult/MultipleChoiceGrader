@@ -2,6 +2,20 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
+FatalErrorLogger.InitializeFallbackLogRoot(Path.Combine(AppContext.BaseDirectory, "logs"));
+AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+{
+    if (eventArgs.ExceptionObject is Exception ex)
+    {
+        FatalErrorLogger.WriteUnhandled("AppDomain.CurrentDomain.UnhandledException", ex);
+    }
+};
+TaskScheduler.UnobservedTaskException += (_, eventArgs) =>
+{
+    FatalErrorLogger.WriteUnhandled("TaskScheduler.UnobservedTaskException", eventArgs.Exception);
+    eventArgs.SetObserved();
+};
+
 var argsResult = CliOptions.Parse(args);
 if (!argsResult.Success)
 {
@@ -15,8 +29,12 @@ var options = argsResult.Options!;
 try
 {
     var appSettings = AppSettingsLoader.Load("appsettings.json");
+    var runConfig = JobContext.Resolve(options, appSettings.Grading, appSettings.OpenAI);
+    FatalErrorLogger.SetPreferredOutputRoot(runConfig.ResultsPath);
+
+    DiagnosticsPrinter.PrintRuntimeConfiguration(runConfig, appSettings.Diagnostics);
     var runner = new JobRunner();
-    var summary = await runner.RunAsync(options, appSettings.Grading, appSettings.OpenAI);
+    var summary = await runner.RunAsync(runConfig, appSettings.Grading, appSettings.OpenAI, appSettings.Diagnostics);
 
     Console.WriteLine();
     Console.WriteLine("=== Job Summary ===");
@@ -31,7 +49,23 @@ try
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"Error: {ex.Message}");
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.Error.WriteLine("========================================");
+    Console.Error.WriteLine("FATAL ERROR");
+    Console.Error.WriteLine("========================================");
+    Console.Error.WriteLine(ex.ToString());
+    var fatalPath = FatalErrorLogger.WriteFatal(ex);
+    Console.Error.WriteLine("========================================");
+    Console.Error.WriteLine($"Fatal diagnostics written to: {fatalPath}");
+    Console.ResetColor();
+
+    var diagnostics = AppSettingsLoader.TryLoadDiagnostics("appsettings.json");
+    if (diagnostics.PauseOnFatalError)
+    {
+        Console.Error.WriteLine("Press Enter to exit...");
+        Console.ReadLine();
+    }
+
     return 1;
 }
 
@@ -82,13 +116,14 @@ public sealed class GradingOptions
     public string? QuizId { get; set; }
 }
 public sealed class OpenAiOptions { public string? ApiKey { get; set; } public string Model { get; set; } = "gpt-4.1-mini"; }
-internal sealed record AppSettings(GradingOptions Grading, OpenAiOptions OpenAI);
+public sealed class DiagnosticsOptions { public bool Verbose { get; set; } = true; public bool PauseOnFatalError { get; set; } }
+internal sealed record AppSettings(GradingOptions Grading, OpenAiOptions OpenAI, DiagnosticsOptions Diagnostics);
 
 internal static class AppSettingsLoader
 {
     public static AppSettings Load(string path)
     {
-        if (!File.Exists(path)) return new AppSettings(new GradingOptions(), new OpenAiOptions());
+        if (!File.Exists(path)) return new AppSettings(new GradingOptions(), new OpenAiOptions(), new DiagnosticsOptions());
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
         var g = new GradingOptions();
         var o = new OpenAiOptions();
@@ -108,10 +143,22 @@ internal static class AppSettingsLoader
             o.ApiKey = ReadString(oe, "ApiKey");
             o.Model = ReadString(oe, "Model") ?? "gpt-4.1-mini";
         }
-        return new AppSettings(g, o);
+        var d = new DiagnosticsOptions();
+        if (doc.RootElement.TryGetProperty("Diagnostics", out var de))
+        {
+            d.Verbose = ReadBool(de, "Verbose") ?? true;
+            d.PauseOnFatalError = ReadBool(de, "PauseOnFatalError") ?? false;
+        }
+        return new AppSettings(g, o, d);
+    }
+    public static DiagnosticsOptions TryLoadDiagnostics(string path)
+    {
+        try { return Load(path).Diagnostics; }
+        catch { return new DiagnosticsOptions(); }
     }
     private static string? ReadString(JsonElement e, string n) => e.TryGetProperty(n, out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
     private static decimal? ReadDecimal(JsonElement e, string n) => e.TryGetProperty(n, out var p) && p.TryGetDecimal(out var d) ? d : null;
+    private static bool? ReadBool(JsonElement e, string n) => e.TryGetProperty(n, out var p) && (p.ValueKind is JsonValueKind.True or JsonValueKind.False) ? p.GetBoolean() : null;
 }
 
 public interface IAnswerExtractionService { Task<ExtractedSubmissionAnswers> ExtractAnswersAsync(string filePath, QuizAnswerKey answerKey, CancellationToken cancellationToken = default); }
@@ -188,23 +235,52 @@ public sealed class SubmissionGradeResult { public string FileName { get; set; }
 
 internal sealed class JobRunner
 {
-    public async Task<JobSummary> RunAsync(CliOptions options, GradingOptions gradingOptions, OpenAiOptions openAiOptions)
+    public async Task<JobSummary> RunAsync(GradingRunConfiguration runConfig, GradingOptions gradingOptions, OpenAiOptions openAiOptions, DiagnosticsOptions diagnostics)
     {
-        var runConfig = JobContext.Resolve(options, gradingOptions);
         var selectedQuiz = AnswerKeyLoader.LoadQuiz(runConfig.AnswerKeyPath, gradingOptions.QuizId);
         var extraction = ResolveExtractionService(gradingOptions, openAiOptions);
         var files = runConfig.SingleFilePath is not null ? new List<string> { runConfig.SingleFilePath } : Directory.GetFiles(runConfig.SubmissionsPath).OrderBy(Path.GetFileName).ToList();
         var extractedDir = Path.Combine(runConfig.ResultsPath, "extracted-answers"); Directory.CreateDirectory(extractedDir);
         var results = new List<SubmissionGradeResult>(); int openAiFailures = 0;
-        foreach (var file in files)
+        for (var index = 0; index < files.Count; index++)
         {
-            var ex = await extraction.ExtractAnswersAsync(file, selectedQuiz);
-            if (!ex.Success) openAiFailures++;
-            var graded = GradeSubmission(ex, selectedQuiz, gradingOptions.ManualReviewConfidenceThreshold);
-            var debugPath = Path.Combine(extractedDir, $"{Path.GetFileNameWithoutExtension(file)}.json");
-            graded.ExtractedAnswersFilePath = debugPath;
-            await File.WriteAllTextAsync(debugPath, JsonSerializer.Serialize(new { ex.FileName, ex.ExtractionProvider, ex.Success, ex.FailureReason, ex.Warnings, ex.Answers, graded.QuestionGrades }, new JsonSerializerOptions { WriteIndented = true }));
-            results.Add(graded);
+            var file = files[index];
+            Console.WriteLine($"Processing {index + 1} of {files.Count}: {Path.GetFileName(file)}");
+            Console.WriteLine($"Extraction provider: {gradingOptions.ExtractionMode}");
+            try
+            {
+                var ex = await extraction.ExtractAnswersAsync(file, selectedQuiz);
+                if (!ex.Success) openAiFailures++;
+                var graded = GradeSubmission(ex, selectedQuiz, gradingOptions.ManualReviewConfidenceThreshold);
+                var debugPath = Path.Combine(extractedDir, $"{Path.GetFileNameWithoutExtension(file)}.json");
+                graded.ExtractedAnswersFilePath = debugPath;
+                await File.WriteAllTextAsync(debugPath, JsonSerializer.Serialize(new { ex.FileName, ex.ExtractionProvider, ex.Success, ex.FailureReason, ex.Warnings, ex.Answers, graded.QuestionGrades }, new JsonSerializerOptions { WriteIndented = true }));
+                results.Add(graded);
+                Console.WriteLine(graded.ManualReviewRequired ? $"Result: ManualReview - {graded.ManualReviewReason}" : "Result: Graded");
+            }
+            catch (Exception ex)
+            {
+                openAiFailures++;
+                var fileName = Path.GetFileName(file);
+                var failureReason = $"Unhandled file processing error: {ex.GetType().Name}: {ex.Message}";
+                var graded = new SubmissionGradeResult
+                {
+                    FileName = fileName,
+                    FileType = Path.GetExtension(fileName).TrimStart('.'),
+                    ExtractionProvider = gradingOptions.ExtractionMode,
+                    ManualReviewRequired = true,
+                    ManualReviewReason = failureReason,
+                    GradingStatus = "ManualReview",
+                    Warnings = "File processing exception; see debug JSON.",
+                    TotalQuestions = selectedQuiz.Answers.Count
+                };
+                var debugPath = Path.Combine(extractedDir, $"{Path.GetFileNameWithoutExtension(file)}.json");
+                graded.ExtractedAnswersFilePath = debugPath;
+                await File.WriteAllTextAsync(debugPath, JsonSerializer.Serialize(new { FileName = fileName, Success = false, FailureReason = failureReason, Exception = ex.ToString() }, new JsonSerializerOptions { WriteIndented = true }));
+                results.Add(graded);
+                FatalErrorLogger.WriteFileError(ex, file, runConfig, diagnostics, debugPath);
+                Console.WriteLine($"Result: ManualReview - {failureReason}");
+            }
         }
         var reportPath = Path.Combine(runConfig.ResultsPath, "grade-report.csv");
         CsvWriter.WriteGradeReport(reportPath, results, selectedQuiz.Answers.Select(a => a.QuestionNumber).ToList());
@@ -257,19 +333,68 @@ internal static class CsvWriter
     private static string Esc(string s) => $"\"{(s ?? "").Replace("\"", "\"\"")}\"";
 }
 
-internal sealed record GradingRunConfiguration(string AnswerKeyPath, string SubmissionsPath, string ResultsPath, string? SingleFilePath);
+internal sealed record GradingRunConfiguration(string AnswerKeyPath, string SubmissionsPath, string ResultsPath, string? SingleFilePath, string? QuizId, string ExtractionMode, bool OpenAiKeyConfigured);
 internal static class JobContext
 {
-    public static GradingRunConfiguration Resolve(CliOptions cli, GradingOptions config)
+    public static GradingRunConfiguration Resolve(CliOptions cli, GradingOptions config, OpenAiOptions openAiOptions)
     {
-        var answerKeyPath = ResolvePath(cli.AnswerKeyPath ?? config.AnswerKeyPath ?? throw new InvalidOperationException("Answer key path required."));
-        var submissionsPath = ResolvePath(cli.SubmissionsPath ?? config.SubmissionsPath ?? throw new InvalidOperationException("Submissions path required."));
-        var resultsPath = ResolvePath(cli.ResultsPath ?? config.ResultsPath ?? throw new InvalidOperationException("Results path required."));
+        var answerKeyPath = ResolvePath(cli.AnswerKeyPath ?? config.AnswerKeyPath ?? "");
+        if (string.IsNullOrWhiteSpace(answerKeyPath) || !File.Exists(answerKeyPath)) throw new InvalidOperationException($"Answer key file was not found: {answerKeyPath}");
+        var submissionsPath = ResolvePath(cli.SubmissionsPath ?? config.SubmissionsPath ?? "");
+        var resultsPath = ResolvePath(cli.ResultsPath ?? config.ResultsPath ?? "");
+        if (string.IsNullOrWhiteSpace(resultsPath)) resultsPath = Path.Combine(AppContext.BaseDirectory, "output");
         Directory.CreateDirectory(resultsPath);
         var singleFile = string.IsNullOrWhiteSpace(config.SingleFilePath) ? null : ResolvePath(config.SingleFilePath!);
-        return new GradingRunConfiguration(answerKeyPath, submissionsPath, resultsPath, singleFile);
+        if (singleFile is not null && !File.Exists(singleFile)) throw new InvalidOperationException($"SingleFilePath was configured but the file was not found: {singleFile}");
+        if (singleFile is null && (string.IsNullOrWhiteSpace(submissionsPath) || !Directory.Exists(submissionsPath))) throw new InvalidOperationException($"Submissions folder was not found: {submissionsPath}");
+        if (string.Equals(config.ExtractionMode, "OpenAI", StringComparison.OrdinalIgnoreCase))
+        {
+            var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? openAiOptions.ApiKey;
+            if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("ExtractionMode is OpenAI but OPENAI_API_KEY or OpenAI:ApiKey is not configured.");
+        }
+        var openAiKeyConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? openAiOptions.ApiKey);
+        return new GradingRunConfiguration(answerKeyPath, submissionsPath, resultsPath, singleFile, config.QuizId, config.ExtractionMode, openAiKeyConfigured);
     }
     private static string ResolvePath(string p) => Path.IsPathRooted(p) ? p : Path.GetFullPath(p);
+}
+
+internal static class DiagnosticsPrinter
+{
+    public static void PrintRuntimeConfiguration(GradingRunConfiguration runConfig, DiagnosticsOptions diagnostics)
+    {
+        if (!diagnostics.Verbose) return;
+        Console.WriteLine("Runtime configuration:");
+        Console.WriteLine($"AnswerKeyPath: {runConfig.AnswerKeyPath}");
+        Console.WriteLine($"SubmissionsFolder: {runConfig.SubmissionsPath}");
+        Console.WriteLine($"OutputFolder: {runConfig.ResultsPath}");
+        Console.WriteLine($"QuizId: {runConfig.QuizId}");
+        Console.WriteLine($"SingleFilePath: {runConfig.SingleFilePath}");
+        Console.WriteLine($"ExtractionMode: {runConfig.ExtractionMode}");
+        Console.WriteLine($"OpenAI API key configured: {runConfig.OpenAiKeyConfigured}");
+    }
+}
+
+internal static class FatalErrorLogger
+{
+    private static string _fallbackLogRoot = Path.Combine(AppContext.BaseDirectory, "logs");
+    private static string? _preferredOutputRoot;
+    public static void InitializeFallbackLogRoot(string path) => _fallbackLogRoot = path;
+    public static void SetPreferredOutputRoot(string path) => _preferredOutputRoot = path;
+    public static string WriteFatal(Exception ex) => WriteLog("fatal-error", ex.ToString());
+    public static void WriteUnhandled(string source, Exception ex) => WriteLog("unhandled-exception", $"{source}{Environment.NewLine}{ex}");
+    public static void WriteFileError(Exception ex, string filePath, GradingRunConfiguration config, DiagnosticsOptions diagnostics, string debugPath)
+        => WriteLog("file-processing-error", $"File: {filePath}{Environment.NewLine}DebugPath: {debugPath}{Environment.NewLine}{BuildRuntimeConfig(config, diagnostics)}{Environment.NewLine}{ex}");
+    private static string WriteLog(string filePrefix, string content)
+    {
+        var logRoot = _preferredOutputRoot is not null ? Path.Combine(_preferredOutputRoot, "logs") : _fallbackLogRoot;
+        Directory.CreateDirectory(logRoot);
+        var logFile = Path.Combine(logRoot, $"{filePrefix}.txt");
+        var payload = $"Timestamp (UTC): {DateTime.UtcNow:O}{Environment.NewLine}{content}{Environment.NewLine}";
+        File.WriteAllText(logFile, payload);
+        return logFile;
+    }
+    private static string BuildRuntimeConfig(GradingRunConfiguration config, DiagnosticsOptions diagnostics)
+        => $"AnswerKeyPath: {config.AnswerKeyPath}{Environment.NewLine}SubmissionsFolder: {config.SubmissionsPath}{Environment.NewLine}OutputFolder: {config.ResultsPath}{Environment.NewLine}QuizId: {config.QuizId}{Environment.NewLine}SingleFilePath: {config.SingleFilePath}{Environment.NewLine}ExtractionMode: {config.ExtractionMode}{Environment.NewLine}OpenAI API key configured: {config.OpenAiKeyConfigured}{Environment.NewLine}Diagnostics.Verbose: {diagnostics.Verbose}";
 }
 
 internal sealed record AnswerKey(string AssignmentName, Dictionary<string, string> Questions);
