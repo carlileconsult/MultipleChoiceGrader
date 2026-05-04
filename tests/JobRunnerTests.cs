@@ -17,7 +17,15 @@ public class JobRunnerTests
         await File.WriteAllTextAsync(keyPath, JsonSerializer.Serialize(new { quizId = "Q1", title = "Q1", answers = new[] { new { questionNumber = 1, correctChoice = "a" } } }));
 
         var runner = new JobRunner();
-        var summary = await runner.RunAsync(new CliOptions(null, keyPath, sub, res, false, false, false, false), new GradingOptions { SingleFilePath = f1, ExtractionMode = "OpenAI", ManualReviewConfidenceThreshold = 0.7m }, new OpenAiOptions());
+        var summary = await runner.RunAsync(
+            new CliOptions(null, keyPath, sub, res, false, false, false, false),
+            new GradingOptions { SingleFilePath = f1, ExtractionMode = "OpenAI", ManualReviewConfidenceThreshold = 0.7m },
+            new OpenAiOptions(),
+            new DiagnosticsOptions
+            {
+                Verbose = false,
+                PauseOnFatalError = false
+            });
         Assert.Equal(1, summary.Processed);
         Assert.True(Directory.GetFiles(summary.ExtractedAnswersFolder, "*.json").Length >= 1);
     }
